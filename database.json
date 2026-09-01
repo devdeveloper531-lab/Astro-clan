@@ -1,0 +1,10 @@
+{
+  "leagues": {},
+  "points": {},
+  "allTimePoints": {},
+  "shop": {
+    "enabled": false,
+    "panelMessageId": null,
+    "items": []
+  }
+}
