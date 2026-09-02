@@ -1,9 +1,11 @@
-// Load .env file only in development (dotenv silently fails if no .env file exists)
+// Load .env file only in development
 if (process.env.NODE_ENV !== 'production') {
   require('dotenv').config();
 }
 
+require('dotenv').config();
 const {
+
   Client,
   GatewayIntentBits,
   ChannelType,
@@ -22,22 +24,10 @@ const {
 const fs = require('fs');
 const path = require('path');
 
-// ─── Config ────────────────────────────────────────────────────────────
+// ─── Config ────────────────────────────────────────────────────────────[...]
 const TOKEN          = process.env.DISCORD_BOT_TOKEN;
 const CLIENT_ID      = process.env.CLIENT_ID;
 const GUILD_ID       = process.env.GUILD_ID;
-
-// Validate required environment variables
-if (!TOKEN || !CLIENT_ID || !GUILD_ID) {
-  console.error('❌ Missing required environment variables:');
-  if (!TOKEN) console.error('  - DISCORD_BOT_TOKEN');
-  if (!CLIENT_ID) console.error('  - CLIENT_ID');
-  if (!GUILD_ID) console.error('  - GUILD_ID');
-  process.exit(1);
-}
-
-console.log('✅ All required environment variables are set');
-
 const LEAGUE_CHANNEL = '1498804106628956211';
 const SHOP_CHANNEL   = '1510600135862648952';
 const HOST_ROLE      = '1459877884645740846';
@@ -64,4 +54,1382 @@ const FORMAT_CAPACITY = { '2v2': 4, '3v3': 6, '4v4': 8 };
 const REGION_LABELS   = {
   europe:        'Europe',
   asia:          'Asia',
+  north_america: 'North America',
+  south_america: 'South America',
+  oceania:       'Oceania',
+};
 
+// ─── Application Questions ────────────────────────────────────────────────────
+const APPLICATION_QUESTIONS = {
+  league_host: [
+    'What is your time zone, and when are you usually available to host league sessions or events?',
+    'Do you have experience hosting leagues, tournaments?',
+    'How would you handle no-shows, late players, or disagreements about rules or results?',
+    'How do you keep things organised (check-ins, voice channels, schedules, and communicating results)?',
+    'Why do you want to be a league host on this server, and what would you bring to the role?',
+  ],
+  rank_management: [
+    'What responsibilities do you associate with rank management?',
+    'How do you handle misuse or mistakes in role assignment?',
+    'Briefly describe your idea of a fair ranking system.',
+    'How would you build a clear and scalable role structure?',
+    'Which criteria should be used for rank promotions?',
+    'How would you document role and permission changes?',
+    'How would you handle complaints about rank decisions?',
+    'How do you ensure nobody gains unfair rank advantages?',
+    'Do you have experience with Discord permission systems? If yes, which?',
+    'How would you respond to a critical role assignment error?',
+  ],
+  staff: [
+    'How old are you?',
+    'What time zone are you in and what times are you usually online?',
+    'Do you have previous staff experience? If yes, where?',
+    'Why do you want to become staff?',
+    'What would you do in a conflict between two members?',
+    'How many hours per week can you actively moderate?',
+    'How do you handle provocative or disrespectful users?',
+    'What does teamwork mean to you in a staff team?',
+    'How would you decide whether a punishment is fair?',
+    'Why should we choose you for the staff team?',
+  ],
+};
+
+// ─── Application storage ──────────────────────────────────────────────────────
+const applicationData = new Map();
+
+// ─── Leaderboard pagination ────────────────────────────────────────────────────
+const leaderboardPages = new Map();
+
+// ─── Database ──────────────────────────────────────────────────────────[...]
+const DB_PATH = './database.json';
+const DB_BACKUP_DIR = './database_backups';
+
+// Ensure backup directory exists
+function ensureBackupDirExists() {
+  if (!fs.existsSync(DB_BACKUP_DIR)) {
+    fs.mkdirSync(DB_BACKUP_DIR, { recursive: true });
+    console.log('[DB] Backup directory created.');
+  }
+}
+
+// Create a backup of the current database
+function createBackup() {
+  ensureBackupDirExists();
+  if (fs.existsSync(DB_PATH)) {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupPath = path.join(DB_BACKUP_DIR, `database_${timestamp}.json`);
+    try {
+      fs.copyFileSync(DB_PATH, backupPath);
+      console.log(`[DB] Backup created: ${backupPath}`);
+      // Keep only last 10 backups
+      const backups = fs.readdirSync(DB_BACKUP_DIR).sort().reverse();
+      if (backups.length > 10) {
+        for (let i = 10; i < backups.length; i++) {
+          fs.unlinkSync(path.join(DB_BACKUP_DIR, backups[i]));
+        }
+      }
+    } catch (err) {
+      console.error('[DB] Failed to create backup:', err);
+    }
+  }
+}
+
+// Restore from backup if main database is corrupted
+function restoreFromBackup() {
+  ensureBackupDirExists();
+  const backups = fs.readdirSync(DB_BACKUP_DIR).sort().reverse();
+  if (backups.length > 0) {
+    const latestBackup = path.join(DB_BACKUP_DIR, backups[0]);
+    try {
+      const backupData = fs.readFileSync(latestBackup, 'utf8');
+      JSON.parse(backupData); // Validate it's valid JSON
+      fs.copyFileSync(latestBackup, DB_PATH);
+      console.log(`[DB] ✓ RESTORED from backup: ${latestBackup}`);
+      return true;
+    } catch (err) {
+      console.error('[DB] Failed to restore from backup:', err);
+    }
+  }
+  return false;
+}
+
+function emptyDB() {
+  return {
+    leagues: {},
+    points: {},
+    allTimePoints: {},
+    shop: {
+      enabled: false,
+      panelMessageId: null,
+      items: [],
+    },
+  };
+}
+
+function loadDB() {
+  if (!fs.existsSync(DB_PATH)) {
+    console.log('[DB] No database found. Creating new one...');
+    const newDB = emptyDB();
+    saveDB(newDB);
+    return newDB;
+  }
+
+  let raw;
+  try {
+    raw = fs.readFileSync(DB_PATH, 'utf8');
+  } catch (err) {
+    console.error('[DB] Failed to read database.json, falling back to empty database:', err);
+    return emptyDB();
+  }
+
+  try {
+    const parsed = JSON.parse(raw);
+    // Validate the shape of the data — fall back to an empty structure for
+    // any missing/corrupted top-level keys so a partial corruption doesn't
+    // crash the bot or wipe unrelated data.
+    const db = {
+      leagues:       parsed && typeof parsed.leagues === 'object' && parsed.leagues !== null ? parsed.leagues : {},
+      points:        parsed && typeof parsed.points === 'object' && parsed.points !== null ? parsed.points : {},
+      allTimePoints: parsed && typeof parsed.allTimePoints === 'object' && parsed.allTimePoints !== null ? parsed.allTimePoints : {},
+      shop: {
+        enabled:        parsed && parsed.shop && typeof parsed.shop.enabled === 'boolean' ? parsed.shop.enabled : false,
+        panelMessageId: parsed && parsed.shop ? (parsed.shop.panelMessageId ?? null) : null,
+        items:          parsed && parsed.shop && Array.isArray(parsed.shop.items) ? parsed.shop.items : [],
+      },
+    };
+    console.log('[DB] ✓ Database loaded successfully. Points entries:', Object.keys(db.points).length);
+    return db;
+  } catch (err) {
+    console.error('[DB] Database is corrupted! Attempting to restore from backup...');
+    
+    // Try to restore from backup
+    const restored = restoreFromBackup();
+    if (restored) {
+      return loadDB(); // Recursively load the restored database
+    }
+    
+    // If no backup available, preserve the corrupted file and return empty database
+    try {
+      const backupPath = `${DB_PATH}.corrupted-${Date.now()}.bak`;
+      fs.writeFileSync(backupPath, raw);
+      console.error(`[DB] Corrupted file backed up to ${backupPath}. Starting fresh.`);
+    } catch (backupErr) {
+      console.error('[DB] Failed to back up corrupted database.json:', backupErr);
+    }
+    return emptyDB();
+  }
+}
+
+function saveDB(data) {
+  try {
+    // Create backup before saving critical changes
+    if (fs.existsSync(DB_PATH)) {
+      createBackup();
+    }
+    
+    fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2));
+    console.log(`[DB] ✓ Saved database.json at ${new Date().toISOString()}`);
+    return true;
+  } catch (err) {
+    console.error('[DB] ✗ Failed to save database.json:', err);
+    return false;
+  }
+}
+
+function generateId() {
+  return Math.random().toString(36).substring(2, 8).toUpperCase();
+}
+
+// ─── Points helpers ───────────────────────────────────────────────────────
+function getPoints(db, userId) {
+  return db.points[userId] || 0;
+}
+
+function setPoints(db, userId, amount) {
+  db.points[userId] = Math.max(0, amount);
+}
+
+function getAllTimePoints(db, userId) {
+  return db.allTimePoints[userId] || 0;
+}
+
+function addAllTimePoints(db, userId, amount) {
+  db.allTimePoints[userId] = (db.allTimePoints[userId] || 0) + amount;
+}
+
+function getCurrentLevel(points) {
+  let level = null;
+  for (const tier of LEVEL_ROLES) {
+    if (points >= tier.points) level = tier;
+  }
+  return level;
+}
+
+async function syncRoles(guild, userId, points) {
+  try {
+    const member = await guild.members.fetch(userId);
+    const currentLevel = getCurrentLevel(points);
+    for (const tier of LEVEL_ROLES) {
+      if (tier.roleId.startsWith('ROLE_ID')) continue;
+      const role = guild.roles.cache.get(tier.roleId);
+      if (!role) continue;
+      if (currentLevel && currentLevel.points >= tier.points) {
+        if (!member.roles.cache.has(tier.roleId)) await member.roles.add(role);
+      } else {
+        if (member.roles.cache.has(tier.roleId)) await member.roles.remove(role);
+      }
+    }
+  } catch (err) {
+    console.error('Role sync failed:', err);
+  }
+}
+
+// ─── League embed builders ────────────────────────────────────────────────────
+function buildLeagueEmbed(league) {
+  const typeLabel  = league.type  === 'swift' ? 'Swift Game' : 'War Game';
+  const perksLabel = league.perks === 'perks' ? 'Perks'      : 'No Perks';
+  const playerList = league.players.map(id => `<@${id}>`).join(', ');
+
+  return new EmbedBuilder()
+    .setTitle('League Available')
+    .setColor(0x5865f2)
+    .addFields(
+      { name: 'Format',     value: league.format,                                    inline: true },
+      { name: 'Match Type', value: typeLabel,                                        inline: true },
+      { name: 'Perks',      value: perksLabel,                                       inline: true },
+      { name: 'Region',     value: REGION_LABELS[league.region],                     inline: true },
+      { name: 'Host',       value: `<@${league.hostId}>`,                            inline: true },
+      { name: 'Spots Left', value: `${league.players.length} / ${league.capacity}`,  inline: true },
+      { name: 'Players',    value: playerList || 'None',                             inline: false },
+      { name: 'League ID',  value: `\`${league.id}\``,                               inline: false },
+    )
+    .setTimestamp();
+}
+
+function buildCancelledLeagueEmbed(league) {
+  const typeLabel  = league.type  === 'swift' ? 'Swift Game' : 'War Game';
+  const perksLabel = league.perks === 'perks' ? 'Perks'      : 'No Perks';
+  const playerList = league.players.map(id => `<@${id}>`).join(', ');
+
+  return new EmbedBuilder()
+    .setTitle('League Cancelled')
+    .setColor(0xe74c3c)
+    .addFields(
+      { name: 'Format',     value: league.format,                                    inline: true },
+      { name: 'Match Type', value: typeLabel,                                        inline: true },
+      { name: 'Perks',      value: perksLabel,                                       inline: true },
+      { name: 'Region',     value: REGION_LABELS[league.region],                     inline: true },
+      { name: 'Host',       value: `<@${league.hostId}>`,                            inline: true },
+      { name: 'Spots Left', value: `${league.players.length} / ${league.capacity}`,  inline: true },
+      { name: 'Players',    value: playerList || 'None',                             inline: false },
+      { name: 'League ID',  value: `\`${league.id}\``,                               inline: false },
+    )
+    .setFooter({ text: 'This league has been cancelled.' })
+    .setTimestamp();
+}
+
+function buildJoinRow(leagueId, disabled = false) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`join_${leagueId}`)
+      .setLabel('Join League')
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(disabled),
+  );
+}
+
+// ─── Shop helpers ────────────────────────────────────────────────────────[...]
+function buildShopPanelEmbed(shopEnabled) {
+  if (!shopEnabled) {
+    return new EmbedBuilder()
+      .setTitle('League Shop')
+      .setColor(0x57606f)
+      .setDescription('The shop is currently **closed**.\nCheck back later.')
+      .setTimestamp();
+  }
+  return new EmbedBuilder()
+    .setTitle('League Shop')
+    .setColor(0xf39c12)
+    .setDescription('Click the button below to open the shop and spend your points on exclusive rewards.')
+    .setTimestamp();
+}
+
+function buildShopPanelRow(shopEnabled) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('open_shop')
+      .setLabel('Open League Shop')
+      .setEmoji('🛒')
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(!shopEnabled),
+  );
+}
+
+function buildShopEmbed(db, userId) {
+  const pts  = getPoints(db, userId);
+  const level = getCurrentLevel(pts);
+
+  const itemLines = db.shop.items.length > 0
+    ? db.shop.items.map(item => {
+        const stockText = item.stock === -1 ? 'In Stock' : item.stock === 0 ? 'Out of Stock' : `${item.stock} left`;
+        return `**${item.name}** — ${item.price} pts\n${item.description}  |  *${stockText}*`;
+      }).join('\n\n')
+    : 'No items in the shop.';
+
+  return new EmbedBuilder()
+    .setTitle('League Shop')
+    .setColor(0xf39c12)
+    .addFields(
+      { name: 'Your Points', value: `${pts} pts`,              inline: true },
+      { name: 'Level',       value: level ? level.label : 'Unranked', inline: true },
+      { name: 'Available Items', value: itemLines, inline: false },
+    )
+    .setFooter({ text: 'Purchasing deducts points from your balance.' })
+    .setTimestamp();
+}
+
+function buildShopBuyRows(db, userId) {
+  const pts = getPoints(db, userId);
+  const rows = [];
+  const chunks = [];
+
+  for (let i = 0; i < db.shop.items.length; i += 5) {
+    chunks.push(db.shop.items.slice(i, i + 5));
+  }
+
+  for (const chunk of chunks) {
+    const row = new ActionRowBuilder();
+    for (const item of chunk) {
+      const canAfford   = pts >= item.price;
+      const inStock     = item.stock !== 0;
+      row.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`buy_${item.id}`)
+          .setLabel(`Buy ${item.name}`)
+          .setStyle(canAfford && inStock ? ButtonStyle.Primary : ButtonStyle.Secondary)
+          .setDisabled(!canAfford || !inStock),
+      );
+    }
+    rows.push(row);
+    if (rows.length >= 4) break;
+  }
+
+  return rows;
+}
+
+// ─── Leaderboard helpers ──────────────────────────────────────────────────────[...]
+function buildLeaderboardEmbed(typeLabel, entries, currentPage, totalPages) {
+  const lines = entries.map(([userId, pts], i) => {
+    const level = getCurrentLevel(pts);
+    return `**${i + 1}.** <@${userId}> — **${pts} pts**${level ? `  |  ${level.label}` : ''}`;
+  }).join('\n');
+
+  return new EmbedBuilder()
+    .setTitle(`Leaderboard — ${typeLabel} Top Point Earners`)
+    .setColor(0xf39c12)
+    .setDescription(lines || 'No entries on this page.')
+    .setFooter({ text: `Page ${currentPage} of ${totalPages}` })
+    .setTimestamp();
+}
+
+function buildLeaderboardButtons(pageKey, currentPage, totalPages) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`lb_prev_${pageKey}`)
+      .setLabel('← Previous')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(currentPage === 1),
+    new ButtonBuilder()
+      .setCustomId(`lb_next_${pageKey}`)
+      .setLabel('Next →')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(currentPage === totalPages),
+  );
+}
+
+// ─── Application helpers ──────────────────────────────────────────────────────
+function buildApplicationPanelEmbed() {
+  return new EmbedBuilder()
+    .setTitle('📋 Application Center')
+    .setColor(0x5865f2)
+    .setDescription('Apply for a role in our server. Click on an application type below to get started!')
+    .addFields(
+      { name: 'Available Applications', value: '• League Host\n• Rank Management\n• Staff', inline: false },
+    )
+    .setTimestamp();
+}
+
+function buildApplicationPanelButtons() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('app_league_host')
+      .setLabel('League Host Application')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId('app_rank_management')
+      .setLabel('Rank Management Application')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId('app_staff')
+      .setLabel('Staff Application')
+      .setStyle(ButtonStyle.Danger),
+  );
+}
+
+function buildApplicationModal(appType) {
+  const questions = APPLICATION_QUESTIONS[appType];
+  const modal = new ModalBuilder()
+    .setCustomId(`modal_${appType}`)
+    .setTitle(appType === 'league_host' ? 'League Host Application' : appType === 'rank_management' ? 'Rank Management Application' : 'Staff Application');
+
+  // Add first 5 questions as text inputs (modal limit)
+  for (let i = 0; i < Math.min(5, questions.length); i++) {
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId(`q${i + 1}`)
+          .setLabel(questions[i].substring(0, 45))
+          .setPlaceholder(questions[i])
+          .setStyle(TextInputStyle.Paragraph)
+          .setRequired(true),
+      ),
+    );
+  }
+
+  return modal;
+}
+
+function buildApplicationReviewEmbed(applicant, appType, answers) {
+  const questions = APPLICATION_QUESTIONS[appType];
+  const appTypeLabel = appType === 'league_host' ? 'League Host' : appType === 'rank_management' ? 'Rank Management' : 'Staff';
+  
+  let description = `**Applicant:** <@${applicant.id}> (${applicant.tag})\n**Application Type:** ${appTypeLabel}\n\n`;
+  
+  // Add first 5 answers
+  for (let i = 0; i < Math.min(5, answers.length); i++) {
+    description += `**Q${i + 1}: ${questions[i]}**\n${answers[i]}\n\n`;
+  }
+
+  return new EmbedBuilder()
+    .setTitle(`📝 ${appTypeLabel} Application Review`)
+    .setColor(0xf39c12)
+    .setDescription(description.substring(0, 4096))
+    .setFooter({ text: `Applicant ID: ${applicant.id}` })
+    .setTimestamp();
+}
+
+function buildApplicationReviewButtons(applicationId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`accept_app_${applicationId}`)
+      .setLabel('Accept')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`deny_app_${applicationId}`)
+      .setLabel('Deny')
+      .setStyle(ButtonStyle.Danger),
+  );
+}
+
+// ─── Slash commands ─────────────────────────────────────────────────────────[...]
+const commands = [
+  // League commands
+  new SlashCommandBuilder()
+    .setName('host-league')
+    .setDescription('Host a new league')
+    .addStringOption(o =>
+      o.setName('format').setDescription('Match format').setRequired(true)
+        .addChoices(
+          { name: '2v2', value: '2v2' },
+          { name: '3v3', value: '3v3' },
+          { name: '4v4', value: '4v4' },
+        ))
+    .addStringOption(o =>
+      o.setName('type').setDescription('Match type').setRequired(true)
+        .addChoices(
+          { name: 'Swift Game', value: 'swift' },
+          { name: 'War Game',   value: 'war'   },
+        ))
+    .addStringOption(o =>
+      o.setName('perks').setDescription('Match perks').setRequired(true)
+        .addChoices(
+          { name: 'Perks',    value: 'perks'    },
+          { name: 'No Perks', value: 'no_perks' },
+        ))
+    .addStringOption(o =>
+      o.setName('region').setDescription('Region').setRequired(true)
+        .addChoices(
+          { name: 'Europe',        value: 'europe'        },
+          { name: 'Asia',          value: 'asia'          },
+          { name: 'North America', value: 'north_america' },
+          { name: 'South America', value: 'south_america' },
+          { name: 'Oceania',       value: 'oceania'       },
+        )),
+
+  new SlashCommandBuilder()
+    .setName('cancel-league')
+    .setDescription('Cancel your hosted league')
+    .addStringOption(o =>
+      o.setName('id').setDescription('League ID').setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName('add-player')
+    .setDescription('Add a player to your league')
+    .addStringOption(o =>
+      o.setName('id').setDescription('League ID').setRequired(true))
+    .addUserOption(o =>
+      o.setName('player').setDescription('Player to add').setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName('remove-player')
+    .setDescription('Remove a player from your league')
+    .addStringOption(o =>
+      o.setName('id').setDescription('League ID').setRequired(true))
+    .addUserOption(o =>
+      o.setName('player').setDescription('Player to remove').setRequired(true)),
+
+  // Points commands
+  new SlashCommandBuilder()
+    .setName('addpoints')
+    .setDescription('Give points to a player (League Host only)')
+    .addUserOption(o =>
+      o.setName('user').setDescription('Player to give points to').setRequired(true))
+    .addIntegerOption(o =>
+      o.setName('amount').setDescription('Amount of points').setRequired(true).setMinValue(1)),
+
+  new SlashCommandBuilder()
+    .setName('removepoints')
+    .setDescription('Remove points from a player (League Host only)')
+    .addUserOption(o =>
+      o.setName('user').setDescription('Player to remove points from').setRequired(true))
+    .addIntegerOption(o =>
+      o.setName('amount').setDescription('Amount of points').setRequired(true).setMinValue(1)),
+
+  new SlashCommandBuilder()
+    .setName('resetpoints')
+    .setDescription('Reset a player\'s points to zero (League Host only)')
+    .addUserOption(o =>
+      o.setName('user').setDescription('Player to reset').setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName('points')
+    .setDescription('Check point balance')
+    .addUserOption(o =>
+      o.setName('user').setDescription('User to check (defaults to yourself)').setRequired(false)),
+
+  new SlashCommandBuilder()
+    .setName('leaderboard')
+    .setDescription('View the top point earners')
+    .addStringOption(o =>
+      o.setName('type').setDescription('Leaderboard type').setRequired(true)
+        .addChoices(
+          { name: 'Current', value: 'current' },
+          { name: 'All Time', value: 'alltime' },
+        )),
+
+  // Shop management (HICOM only)
+  new SlashCommandBuilder()
+    .setName('shop')
+    .setDescription('Manage the League Shop (HICOM only)')
+    .addSubcommand(sub =>
+      sub.setName('enable').setDescription('Enable the shop'))
+    .addSubcommand(sub =>
+      sub.setName('disable').setDescription('Disable the shop'))
+    .addSubcommand(sub =>
+      sub.setName('refresh').setDescription('Repost the shop panel in the shop channel')),
+
+  new SlashCommandBuilder()
+    .setName('addreward')
+    .setDescription('Add a new item to the shop (HICOM only)')
+    .addStringOption(o =>
+      o.setName('name').setDescription('Item name').setRequired(true))
+    .addIntegerOption(o =>
+      o.setName('price').setDescription('Price in points').setRequired(true).setMinValue(1))
+    .addStringOption(o =>
+      o.setName('description').setDescription('Item description').setRequired(true))
+    .addIntegerOption(o =>
+      o.setName('stock').setDescription('Stock count (-1 = unlimited)').setRequired(false)),
+
+  new SlashCommandBuilder()
+    .setName('editreward')
+    .setDescription('Edit a shop item (HICOM only)')
+    .addStringOption(o =>
+      o.setName('name').setDescription('Item name to edit').setRequired(true))
+    .addStringOption(o =>
+      o.setName('newname').setDescription('New name').setRequired(false))
+    .addIntegerOption(o =>
+      o.setName('price').setDescription('New price').setRequired(false))
+    .addIntegerOption(o =>
+      o.setName('stock').setDescription('New stock (-1 = unlimited, 0 = out of stock)').setRequired(false))
+    .addStringOption(o =>
+      o.setName('description').setDescription('New description').setRequired(false)),
+
+  // Application commands
+  new SlashCommandBuilder()
+    .setName('setup-applications')
+    .setDescription('Post the application panel (HICOM only)')
+    .addSubcommand(sub =>
+      sub.setName('staff').setDescription('Post staff application panel'))
+    .addSubcommand(sub =>
+      sub.setName('normal').setDescription('Post normal applications panel (league host & rank management)')),
+].map(c => c.toJSON());
+
+// ─── Register commands ─────────────────────────────────────────────────────���──[...]
+async function registerCommands() {
+  const rest = new REST({ version: '10' }).setToken(TOKEN);
+  try {
+    console.log('Registering slash commands...');
+    await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
+    console.log('Slash commands registered successfully.');
+  } catch (err) {
+    console.error('Failed to register commands:', err);
+  }
+}
+
+// ─── Client ──────────────────────────────────────────────────────────────[...]
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.DirectMessages,
+  ],
+});
+
+client.once('ready', async () => {
+  console.log('\n═══════════════════════════════════════════════════════');
+  console.log(`[Bot] ✓ Online as ${client.user.tag}`);
+  
+  // Load and verify database on startup
+  const db = loadDB();
+  const pointsCount = Object.keys(db.points).length;
+  const allTimeCount = Object.keys(db.allTimePoints).length;
+  
+  console.log(`[Bot] ✓ Database verified: ${pointsCount} users with current points, ${allTimeCount} users with all-time points`);
+  console.log('═══════════════════════════════════════════════════════\n');
+  
+  await registerCommands();
+});
+
+// ─── Interaction helpers ─────────────────────────────────────────────────────
+// Safely respond to an interaction (update/reply/followUp), swallowing errors
+// caused by expired/invalid interactions so they never crash the process.
+const IGNORABLE_INTERACTION_ERROR_CODES = new Set([
+  10062, // Unknown interaction (expired / already acknowledged too late)
+  10008, // Unknown message
+  40060, // Interaction has already been acknowledged
+]);
+
+async function safeInteractionRespond(interaction, method, payload) {
+  try {
+    return await interaction[method](payload);
+  } catch (err) {
+    if (err && IGNORABLE_INTERACTION_ERROR_CODES.has(err.code)) {
+      console.warn(`[Interaction] Ignored expired/invalid interaction (code ${err.code}) on "${method}" for customId "${interaction.customId || interaction.commandName || 'unknown'}".`);
+      return null;
+    }
+    console.error(`[Interaction] Failed to ${method} interaction:`, err);
+    return null;
+  }
+}
+
+// ─── Interactions ────────────────────────────────────────────────────────────[...]
+client.on('interactionCreate', async interaction => {
+  const { member, guild } = interaction;
+
+  // ── Button: Join League ───────────────────────────────────────────────────
+  if (interaction.isButton() && interaction.customId.startsWith('join_')) {
+    const id     = interaction.customId.replace('join_', '');
+    const db     = loadDB();
+    const league = db.leagues[id];
+
+    if (!league) return interaction.reply({ content: 'This league no longer exists.', ephemeral: true });
+    if (league.players.includes(member.id)) return interaction.reply({ content: 'You are already in this league.', ephemeral: true });
+    if (league.players.length >= league.capacity) return interaction.reply({ content: 'This league is full.', ephemeral: true });
+
+    league.players.push(member.id);
+    db.leagues[id] = league;
+    saveDB(db);
+
+    try {
+      const thread = await guild.channels.fetch(league.threadId);
+      if (thread) {
+        await thread.members.add(member.id);
+        await thread.send({ content: `<@${member.id}> has joined the league. (${league.players.length}/${league.capacity})` });
+      }
+    } catch (err) { console.error('Thread add failed:', err); }
+
+    const isFull = league.players.length >= league.capacity;
+    await safeInteractionRespond(interaction, 'update', {
+      embeds:     [buildLeagueEmbed(league)],
+      components: [buildJoinRow(id, isFull)],
+    });
+
+    return safeInteractionRespond(interaction, 'followUp', { content: `You have joined league **${id}**. Check your private thread.`, ephemeral: true });
+  }
+
+  // ── Button: Open Shop ─────────────────────────────────────────────────────
+  if (interaction.isButton() && interaction.customId === 'open_shop') {
+    const db = loadDB();
+    if (!db.shop.enabled) return interaction.reply({ content: 'The shop is currently closed.', ephemeral: true });
+
+    const rows = buildShopBuyRows(db, member.id);
+    return interaction.reply({
+      embeds:     [buildShopEmbed(db, member.id)],
+      components: rows,
+      ephemeral:  true,
+    });
+  }
+
+  // ── Button: Buy Item ──────────────────────────────────────────────────────
+  if (interaction.isButton() && interaction.customId.startsWith('buy_')) {
+    const itemId = interaction.customId.replace('buy_', '');
+    const db     = loadDB();
+    if (!db.shop.enabled) return interaction.reply({ content: 'The shop is currently closed.', ephemeral: true });
+
+    const item = db.shop.items.find(i => i.id === itemId);
+    if (!item) return interaction.reply({ content: 'That item no longer exists.', ephemeral: true });
+
+    const pts = getPoints(db, member.id);
+    if (pts < item.price) return interaction.reply({ content: `You need **${item.price} pts** but only have **${pts} pts**.`, ephemeral: true });
+    if (item.stock === 0) return interaction.reply({ content: 'This item is out of stock.', ephemeral: true });
+
+    setPoints(db, member.id, pts - item.price);
+    if (item.stock > 0) item.stock -= 1;
+
+    console.log(`[Shop] ${member.id} is buying "${item.name}" for ${item.price} pts. Saving database...`);
+    const saved = saveDB(db);
+    if (!saved) {
+      console.error(`[Shop] Failed to persist purchase of "${item.name}" by ${member.id} to database.json.`);
+    } else {
+      console.log(`[Shop] Purchase of "${item.name}" by ${member.id} saved successfully.`);
+    }
+
+    try {
+      await syncRoles(guild, member.id, getPoints(db, member.id));
+    } catch (err) {
+      console.error(`[Shop] Role sync failed after purchase for ${member.id}, but points were already saved:`, err);
+    }
+
+    return interaction.reply({
+      content: `**Purchase Successful**\nYou bought **${item.name}** for **${item.price} pts**.\nRemaining balance: **${getPoints(db, member.id)} pts**\n\nPlease open a ticket or contact a staff member for assistance.`,
+      ephemeral: true,
+    });
+  }
+
+  // ── Button: Leaderboard pagination ────────────────────────────────────────
+  if (interaction.isButton() && (interaction.customId.startsWith('lb_next_') || interaction.customId.startsWith('lb_prev_'))) {
+    const [action, pageKey] = interaction.customId.includes('_next_') 
+      ? ['next', interaction.customId.replace('lb_next_', '')] 
+      : ['prev', interaction.customId.replace('lb_prev_', '')];
+    
+    if (!leaderboardPages.has(pageKey)) {
+      return interaction.reply({ content: 'This leaderboard session has expired. Use `/leaderboard` again.', ephemeral: true });
+    }
+
+    const pageData = leaderboardPages.get(pageKey);
+    const currentPage = action === 'next' ? pageData.currentPage + 1 : pageData.currentPage - 1;
+
+    if (currentPage < 1 || currentPage > pageData.totalPages) {
+      return interaction.reply({ content: 'Invalid page.', ephemeral: true });
+    }
+
+    const startIdx = (currentPage - 1) * 10;
+    const endIdx = startIdx + 10;
+    const pageEntries = pageData.allEntries.slice(startIdx, endIdx);
+
+    const embed = buildLeaderboardEmbed(pageData.typeLabel, pageEntries, currentPage, pageData.totalPages);
+    const buttons = buildLeaderboardButtons(pageKey, currentPage, pageData.totalPages);
+
+    // Update the page data
+    pageData.currentPage = currentPage;
+    leaderboardPages.set(pageKey, pageData);
+
+    await safeInteractionRespond(interaction, 'update', {
+      embeds: [embed],
+      components: [buttons],
+    });
+  }
+
+  // ── Button: Application buttons ────────────────────────────────────────────
+  if (interaction.isButton() && interaction.customId.startsWith('app_')) {
+    const appType = interaction.customId.replace('app_', '');
+    const modal = buildApplicationModal(appType);
+    await interaction.showModal(modal);
+  }
+
+  // ── Button: Accept/Deny Application ────────────────────────────────────────
+  if (interaction.isButton() && (interaction.customId.startsWith('accept_app_') || interaction.customId.startsWith('deny_app_'))) {
+    const isAccept = interaction.customId.startsWith('accept_app_');
+    const applicationId = interaction.customId.replace(isAccept ? 'accept_app_' : 'deny_app_', '');
+
+    if (!member.roles.cache.has(HICOM_ROLE) && !member.roles.cache.has(STAFF_ROLE)) {
+      return interaction.reply({ content: 'Only Staff and HICOM can review applications.', ephemeral: true });
+    }
+
+    const appData = applicationData.get(applicationId);
+    if (!appData) return interaction.reply({ content: 'Application data not found.', ephemeral: true });
+
+    // For staff applications, only HICOM can accept/deny
+    if (appData.type === 'staff' && !member.roles.cache.has(HICOM_ROLE)) {
+      return interaction.reply({ content: 'Only HICOM can review Staff applications.', ephemeral: true });
+    }
+
+    const appTypeLabel = appData.type === 'league_host' ? 'League Host' : appData.type === 'rank_management' ? 'Rank Management' : 'Staff';
+
+    if (isAccept) {
+      try {
+        const targetMember = await guild.members.fetch(appData.applicantId);
+        if (appData.type === 'league_host') {
+          await targetMember.roles.add(HOST_ROLE);
+        } else if (appData.type === 'rank_management') {
+          await targetMember.roles.add(RANK_MANAGEMENT_ROLE);
+        } else if (appData.type === 'staff') {
+          await targetMember.roles.add(STAFF_ROLE);
+          await targetMember.roles.add(TRIAL_MOD_ROLE);
+        }
+      } catch (err) {
+        console.error('Failed to assign role:', err);
+      }
+
+      // Send DM to applicant
+      try {
+        const applicant = await client.users.fetch(appData.applicantId);
+        await applicant.send(`✅ **Congratulations!** Your **${appTypeLabel}** application has been **ACCEPTED**! You have been assigned the appropriate role(s).`);
+      } catch (err) {
+        console.error('Failed to send acceptance DM:', err);
+      }
+
+      // Post to review channel
+      await guild.channels.fetch(REVIEW_CHANNEL).then(channel => {
+        channel.send({ content: `✅ Application from <@${appData.applicantId}> has been **accepted**.` });
+      }).catch(err => console.error('Failed to post to review channel:', err));
+
+      // For rank management, also post to rank management channel
+      if (appData.type === 'rank_management') {
+        try {
+          const rankChannel = await guild.channels.fetch(RANK_MANAGEMENT_CHANNEL);
+          await rankChannel.send({ content: `✅ New Rank Manager: <@${appData.applicantId}> has been **accepted**.` });
+        } catch (err) {
+          console.error('Failed to post to rank management channel:', err);
+        }
+      }
+
+      await interaction.reply({ content: `✅ Application from <@${appData.applicantId}> has been **accepted**.`, ephemeral: false });
+    } else {
+      // Send DM to applicant
+      try {
+        const applicant = await client.users.fetch(appData.applicantId);
+        await applicant.send(`❌ Your **${appTypeLabel}** application has been **DENIED**. Thank you for applying!`);
+      } catch (err) {
+        console.error('Failed to send denial DM:', err);
+      }
+
+      await interaction.reply({ content: `❌ Application from <@${appData.applicantId}> has been **denied**.`, ephemeral: false });
+    }
+
+    applicationData.delete(applicationId);
+  }
+
+  // ── Modal: Application submission ───────────────────────────────────────────
+  if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_')) {
+    const appType = interaction.customId.replace('modal_', '');
+    const answers = [];
+
+    for (let i = 1; i <= 5; i++) {
+      const answer = interaction.fields.getTextInputValue(`q${i}`);
+      if (answer) answers.push(answer);
+    }
+
+    const applicationId = `${member.id}_${appType}_${Date.now()}`;
+    applicationData.set(applicationId, {
+      applicantId: member.id,
+      type: appType,
+      answers,
+    });
+
+    const embed = buildApplicationReviewEmbed(interaction.user, appType, answers);
+    const buttons = buildApplicationReviewButtons(applicationId);
+
+    try {
+      const reviewChannel = await guild.channels.fetch(REVIEW_CHANNEL);
+      await reviewChannel.send({ embeds: [embed], components: [buttons] });
+    } catch (err) {
+      console.error('Failed to send application to review channel:', err);
+    }
+
+    const appTypeLabel = appType === 'league_host' ? 'League Host' : appType === 'rank_management' ? 'Rank Management' : 'Staff';
+    return interaction.reply({
+      content: `✅ Your ${appTypeLabel} application has been submitted! The staff team will review it shortly.`,
+      ephemeral: true,
+    });
+  }
+
+  if (!interaction.isChatInputCommand()) return;
+
+  const { commandName } = interaction;
+
+  // ── /host-league ────────────────────────────────────────────────────────────[...]
+  if (commandName === 'host-league') {
+    if (interaction.channelId !== LEAGUE_CHANNEL) return interaction.reply({ content: `Leagues can only be hosted in <#${LEAGUE_CHANNEL}>.`, ephemeral: true });
+    if (!member.roles.cache.has(HOST_ROLE)) return interaction.reply({ content: 'You do not have permission to host leagues.', ephemeral: true });
+
+    const format = interaction.options.getString('format');
+    const type   = interaction.options.getString('type');
+    const perks  = interaction.options.getString('perks');
+    const region = interaction.options.getString('region');
+    const id     = generateId();
+
+    const db = loadDB();
+    const league = {
+      id, format, type, perks, region,
+      capacity:       FORMAT_CAPACITY[format],
+      hostId:         member.id,
+      players:        [member.id],
+      threadId:       null,
+      embedMessageId: null,
+    };
+
+    await interaction.deferReply({ ephemeral: true });
+
+    const leagueChannel = await guild.channels.fetch(LEAGUE_CHANNEL);
+
+    const embedMsg = await leagueChannel.send({
+      embeds:     [buildLeagueEmbed(league)],
+      components: [buildJoinRow(id)],
+    });
+    league.embedMessageId = embedMsg.id;
+
+    await leagueChannel.send({ content: `<@&${PING_ROLE}> New league available: **${id}**` });
+
+    const thread = await leagueChannel.threads.create({
+      name:                `League ${id}`,
+      type:                ChannelType.PrivateThread,
+      autoArchiveDuration: ThreadAutoArchiveDuration.OneWeek,
+      reason:              `Private thread for league ${id}`,
+      invitable:           false,
+    });
+
+    await thread.members.add(member.id);
+
+    const typeLabel  = type  === 'swift' ? 'Swift Game' : 'War Game';
+    const perksLabel = perks === 'perks' ? 'Perks'      : 'No Perks';
+
+    await thread.send({ content: `**League ${id} — Private Session**\n\nHost: <@${member.id}>\nFormat: ${format}  |  ${typeLabel}  |  ${perksLabel}  |  ${REGION_LABELS[region]}` });
+
+    league.threadId = thread.id;
+    db.leagues[id]  = league;
+    saveDB(db);
+
+    return interaction.editReply({ content: `League **${id}** created. Your private thread is open.` });
+  }
+
+  // ── /cancel-league ────────────────────────────────────────────────────────────
+  if (commandName === 'cancel-league') {
+    const id     = interaction.options.getString('id').toUpperCase();
+    const db     = loadDB();
+    const league = db.leagues[id];
+
+    if (!league) return interaction.reply({ content: `No league found with ID **${id}**.`, ephemeral: true });
+    if (!member.roles.cache.has(HOST_ROLE)) return interaction.reply({ content: 'You do not have permission to cancel leagues.', ephemeral: true });
+    if (league.hostId !== member.id) return interaction.reply({ content: 'You can only cancel leagues that you are hosting.', ephemeral: true });
+
+    if (league.threadId) {
+      try {
+        const thread = await guild.channels.fetch(league.threadId);
+        if (thread) await thread.delete();
+      } catch (err) { console.error('Thread delete failed:', err); }
+    }
+
+    try {
+      const leagueChannel = await guild.channels.fetch(LEAGUE_CHANNEL);
+      const embedMsg      = await leagueChannel.messages.fetch(league.embedMessageId);
+      await embedMsg.edit({ embeds: [buildCancelledLeagueEmbed(league)], components: [buildJoinRow(id, true)] });
+    } catch (err) { console.error('Embed update failed:', err); }
+
+    delete db.leagues[id];
+    saveDB(db);
+
+    try {
+      await interaction.reply({ content: `**League Cancelled**\nLeague **${id}** hosted by <@${member.id}> has been cancelled.` });
+    } catch (err) { console.error('Reply failed:', err); }
+  }
+
+  // ── /add-player ────────────────────────────────────────────────────────────────[...]
+  if (commandName === 'add-player') {
+    const id     = interaction.options.getString('id').toUpperCase();
+    const target = interaction.options.getUser('player');
+    const db     = loadDB();
+    const league = db.leagues[id];
+
+    if (!league) return interaction.reply({ content: `No league found with ID **${id}**.`, ephemeral: true });
+    if (league.hostId !== member.id) return interaction.reply({ content: 'Only the league host can add players.', ephemeral: true });
+    if (league.players.includes(target.id)) return interaction.reply({ content: `<@${target.id}> is already in this league.`, ephemeral: true });
+    if (league.players.length >= league.capacity) return interaction.reply({ content: 'The league is already full.', ephemeral: true });
+
+    league.players.push(target.id);
+    db.leagues[id] = league;
+    saveDB(db);
+
+    try {
+      const thread = await guild.channels.fetch(league.threadId);
+      if (thread) { await thread.members.add(target.id); await thread.send({ content: `<@${target.id}> was added to the league by the host. (${league.players.length}/${league.capacity})` }); }
+    } catch (err) { console.error('Thread add failed:', err); }
+
+    const isFull = league.players.length >= league.capacity;
+    try {
+      const leagueChannel = await guild.channels.fetch(LEAGUE_CHANNEL);
+      const embedMsg      = await leagueChannel.messages.fetch(league.embedMessageId);
+      await embedMsg.edit({ embeds: [buildLeagueEmbed(league)], components: [buildJoinRow(league.id, isFull)] });
+    } catch (err) { console.error('Embed update failed:', err); }
+
+    return interaction.reply({ content: `<@${target.id}> has been added to league **${id}**.`, ephemeral: true });
+  }
+
+  // ── /remove-player ────────────────────────────────────────────────────────────[...]
+  if (commandName === 'remove-player') {
+    const id     = interaction.options.getString('id').toUpperCase();
+    const target = interaction.options.getUser('player');
+    const db     = loadDB();
+    const league = db.leagues[id];
+
+    if (!league) return interaction.reply({ content: `No league found with ID **${id}**.`, ephemeral: true });
+    if (league.hostId !== member.id) return interaction.reply({ content: 'Only the league host can remove players.', ephemeral: true });
+    if (target.id === league.hostId) return interaction.reply({ content: 'The host cannot be removed from the league.', ephemeral: true });
+    if (!league.players.includes(target.id)) return interaction.reply({ content: `<@${target.id}> is not in this league.`, ephemeral: true });
+
+    league.players = league.players.filter(p => p !== target.id);
+    db.leagues[id] = league;
+    saveDB(db);
+
+    try {
+      const thread = await guild.channels.fetch(league.threadId);
+      if (thread) { await thread.members.remove(target.id); await thread.send({ content: `<@${target.id}> was removed from the league by the host. (${league.players.length}/${league.capacity})` }); }
+    } catch (err) { console.error('Thread remove failed:', err); }
+
+    try {
+      const leagueChannel = await guild.channels.fetch(LEAGUE_CHANNEL);
+      const embedMsg      = await leagueChannel.messages.fetch(league.embedMessageId);
+      await embedMsg.edit({ embeds: [buildLeagueEmbed(league)], components: [buildJoinRow(league.id, false)] });
+    } catch (err) { console.error('Embed update failed:', err); }
+
+    return interaction.reply({ content: `<@${target.id}> has been removed from league **${id}**.`, ephemeral: true });
+  }
+
+  // ── /addpoints ────────────────────────────────────────────────────────────────[...]
+  if (commandName === 'addpoints') {
+    if (!member.roles.cache.has(HOST_ROLE)) return interaction.reply({ content: 'You do not have permission to give points.', ephemeral: true });
+
+    const target = interaction.options.getUser('user');
+    const amount = interaction.options.getInteger('amount');
+    const db     = loadDB();
+
+    const before = getPoints(db, target.id);
+    setPoints(db, target.id, before + amount);
+    addAllTimePoints(db, target.id, amount);
+
+    console.log(`[Points] Adding ${amount} pts to ${target.id}. Saving database...`);
+    const saved = saveDB(db);
+    if (!saved) {
+      console.error(`[Points] Failed to persist added points for ${target.id}. Data may be lost on restart.`);
+    } else {
+      console.log(`[Points] Points for ${target.id} saved successfully.`);
+    }
+
+    try {
+      await syncRoles(guild, target.id, getPoints(db, target.id));
+    } catch (err) {
+      console.error(`[Points] Role sync failed for ${target.id} after adding points, but points were already saved:`, err);
+    }
+
+    const after = getPoints(db, target.id);
+    const level = getCurrentLevel(after);
+
+    return interaction.reply({
+      content: `**Points Added**\n<@${target.id}> has been given **${amount} pts**.\nNew balance: **${after} pts**${level ? `  |  ${level.label}` : ''}`,
+    });
+  }
+
+  // ── /removepoints ─────────────────────────────────────────────────────────────[...]
+  if (commandName === 'removepoints') {
+    if (!member.roles.cache.has(HOST_ROLE)) return interaction.reply({ content: 'You do not have permission to remove points.', ephemeral: true });
+
+    const target = interaction.options.getUser('user');
+    const amount = interaction.options.getInteger('amount');
+    const db     = loadDB();
+
+    const before = getPoints(db, target.id);
+    setPoints(db, target.id, before - amount);
+
+    console.log(`[Points] Removing ${amount} pts from ${target.id}. Saving database...`);
+    const saved = saveDB(db);
+    if (!saved) {
+      console.error(`[Points] Failed to persist removed points for ${target.id}. Data may be lost on restart.`);
+    } else {
+      console.log(`[Points] Points for ${target.id} saved successfully.`);
+    }
+
+    try {
+      await syncRoles(guild, target.id, getPoints(db, target.id));
+    } catch (err) {
+      console.error(`[Points] Role sync failed for ${target.id} after removing points, but points were already saved:`, err);
+    }
+
+    const after = getPoints(db, target.id);
+    return interaction.reply({
+      content: `**Points Removed**\n**${amount} pts** deducted from <@${target.id}>.\nNew balance: **${after} pts**`,
+    });
+  }
+
+  // ── /resetpoints ──────────────────────────────────────────────────────────────[...]
+  if (commandName === 'resetpoints') {
+    if (!member.roles.cache.has(HOST_ROLE)) return interaction.reply({ content: 'You do not have permission to reset points.', ephemeral: true });
+
+    const target = interaction.options.getUser('user');
+    const db     = loadDB();
+
+    setPoints(db, target.id, 0);
+    saveDB(db);
+
+    await syncRoles(guild, target.id, 0);
+
+    return interaction.reply({ content: `**Points Reset**\n<@${target.id}>'s points have been reset to **0 pts**.` });
+  }
+
+  // ── /points ────────────────────────────────────────────────────────────────[...]
+  if (commandName === 'points') {
+    const target = interaction.options.getUser('user') || interaction.user;
+    const db     = loadDB();
+    const pts    = getPoints(db, target.id);
+    const allTimePts = getAllTimePoints(db, target.id);
+    const level  = getCurrentLevel(pts);
+
+    const embed = new EmbedBuilder()
+      .setTitle(`${target.username}'s Points`)
+      .setColor(0x5865f2)
+      .addFields(
+        { name: 'Current Points', value: `${pts} pts`,                     inline: true },
+        { name: 'All Time Points', value: `${allTimePts} pts`,             inline: true },
+        { name: 'Level',           value: level ? level.label : 'Unranked', inline: true },
+      )
+      .setThumbnail(target.displayAvatarURL())
+      .setTimestamp();
+
+    return interaction.reply({ embeds: [embed], ephemeral: true });
+  }
+
+  // ── /leaderboard ──────────────────────────────────────────────────────────────[...]
+  if (commandName === 'leaderboard') {
+    const db        = loadDB();
+    const type      = interaction.options.getString('type');
+    const pointsObj = type === 'current' ? db.points : db.allTimePoints;
+    const allEntries = Object.entries(pointsObj)
+      .sort(([, a], [, b]) => b - a);
+
+    if (allEntries.length === 0) {
+      return interaction.reply({ content: 'No points have been awarded yet.', ephemeral: true });
+    }
+
+    const typeLabel = type === 'current' ? 'Current' : 'All Time';
+    const totalPages = Math.ceil(allEntries.length / 10);
+    const pageKey = `${interaction.user.id}_${type}_${Date.now()}`;
+
+    // Store page data
+    leaderboardPages.set(pageKey, {
+      allEntries,
+      currentPage: 1,
+      totalPages,
+      typeLabel,
+    });
+
+    // Get first page entries
+    const pageEntries = allEntries.slice(0, 10);
+    const embed = buildLeaderboardEmbed(typeLabel, pageEntries, 1, totalPages);
+    const buttons = buildLeaderboardButtons(pageKey, 1, totalPages);
+
+    // Clean up old leaderboard sessions for this user after 15 minutes
+    setTimeout(() => {
+      leaderboardPages.delete(pageKey);
+    }, 15 * 60 * 1000);
+
+    return interaction.reply({
+      embeds: [embed],
+      components: [buttons],
+    });
+  }
+
+  // ── /shop ────────────────────────────────────────────────────────────────[...]
+  if (commandName === 'shop') {
+    if (!member.roles.cache.has(HICOM_ROLE)) return interaction.reply({ content: 'Only HICOM can manage the shop.', ephemeral: true });
+
+    const sub = interaction.options.getSubcommand();
+    const db  = loadDB();
+
+    // Shared helper: post a fresh panel or update the existing one
+    async function postOrUpdatePanel(enabled) {
+      const shopChannel = await guild.channels.fetch(SHOP_CHANNEL);
+      let panelMsg = null;
+
+      // Try to fetch existing panel
+      if (db.shop.panelMessageId) {
+        try {
+          panelMsg = await shopChannel.messages.fetch(db.shop.panelMessageId);
+        } catch (err) {
+          panelMsg = null; // message was deleted, will repost
+        }
+      }
+
+      if (panelMsg) {
+        await panelMsg.edit({
+          embeds:     [buildShopPanelEmbed(enabled)],
+          components: [buildShopPanelRow(enabled)],
+        });
+      } else {
+        // Delete old id if stale, then post fresh
+        panelMsg = await shopChannel.send({
+          embeds:     [buildShopPanelEmbed(enabled)],
+          components: [buildShopPanelRow(enabled)],
+        });
+        db.shop.panelMessageId = panelMsg.id;
+        saveDB(db);
+      }
+    }
+
+    if (sub === 'enable') {
+      db.shop.enabled = true;
+      saveDB(db);
+      await postOrUpdatePanel(true);
+      return interaction.reply({ content: 'The shop is now **open**. The panel has been posted in the shop channel.', ephemeral: true });
+    }
+
+    if (sub === 'disable') {
+      db.shop.enabled = false;
+      saveDB(db);
+      await postOrUpdatePanel(false);
+      return interaction.reply({ content: 'The shop is now **closed**. The panel has been updated.', ephemeral: true });
+    }
+
+    if (sub === 'refresh') {
+      const shopChannel = await guild.channels.fetch(SHOP_CHANNEL);
+
+      // Always delete old panel and repost fresh
+      if (db.shop.panelMessageId) {
+        try {
+          const old = await shopChannel.messages.fetch(db.shop.panelMessageId);
+          await old.delete();
+        } catch (err) { /* already gone */ }
+      }
+
+      const panelMsg = await shopChannel.send({
+        embeds:     [buildShopPanelEmbed(db.shop.enabled)],
+        components: [buildShopPanelRow(db.shop.enabled)],
+      });
+
+      db.shop.panelMessageId = panelMsg.id;
+      saveDB(db);
+
+      return interaction.reply({ content: 'Shop panel has been reposted in the shop channel.', ephemeral: true });
+    }
+  }
+
+  // ── /addreward ────────────────────────────────────────────────────────────────[...]
+  if (commandName === 'addreward') {
+    if (!member.roles.cache.has(HICOM_ROLE)) return interaction.reply({ content: 'Only HICOM can manage shop rewards.', ephemeral: true });
+
+    const name        = interaction.options.getString('name');
+    const price       = interaction.options.getInteger('price');
+    const description = interaction.options.getString('description');
+    const stock       = interaction.options.getInteger('stock') ?? -1;
+    const db          = loadDB();
+
+    const id = name.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '').substring(0, 20) + '_' + Date.now().toString(36);
+    db.shop.items.push({ id, name, price, stock, description });
+    saveDB(db);
+
+    return interaction.reply({ content: `Reward **${name}** (${price} pts) added to the shop.`, ephemeral: true });
+  }
+
+  // ── /editreward ──────────────────────────────────────────────────────────────[...]
+  if (commandName === 'editreward') {
+    if (!member.roles.cache.has(HICOM_ROLE)) return interaction.reply({ content: 'Only HICOM can manage shop rewards.', ephemeral: true });
+
+    const itemName = interaction.options.getString('name');
+    const db       = loadDB();
+    const item     = db.shop.items.find(i => i.name === itemName);
+
+    if (!item) return interaction.reply({ content: `No shop item found with name **${itemName}**.`, ephemeral: true });
+
+    const newName  = interaction.options.getString('newname');
+    const newPrice = interaction.options.getInteger('price');
+    const newStock = interaction.options.getInteger('stock');
+    const newDesc  = interaction.options.getString('description');
+
+    if (newName  !== null) item.name        = newName;
+    if (newPrice !== null) item.price       = newPrice;
+    if (newStock !== null) item.stock       = newStock;
+    if (newDesc  !== null) item.description = newDesc;
+
+    saveDB(db);
+    return interaction.reply({ content: `Reward **${item.name}** has been updated.`, ephemeral: true });
+  }
+
+  // ── /setup-applications ──────────────────────────────────────────────────────────
+  if (commandName === 'setup-applications') {
+    if (!member.roles.cache.has(HICOM_ROLE)) return interaction.reply({ content: 'Only HICOM can set up applications.', ephemeral: true });
+
+    const sub = interaction.options.getSubcommand();
+
+    try {
+      const supportChannel = await guild.channels.fetch(SUPPORT_CHANNEL);
+      
+      if (sub === 'staff') {
+        // Create staff-only button
+        const staffRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId('app_staff')
+            .setLabel('Staff Application')
+            .setStyle(ButtonStyle.Danger),
+        );
+        
+        const staffEmbed = new EmbedBuilder()
+          .setTitle('📋 Staff Application')
+          .setColor(0xff0000)
+          .setDescription('Click the button below to apply for a staff position.')
+          .setTimestamp();
+
+        await supportChannel.send({
+          embeds: [staffEmbed],
+          components: [staffRow],
+        });
+        return interaction.reply({ content: '✅ Staff application panel has been posted to the support channel.', ephemeral: true });
+      } else if (sub === 'normal') {
+        // Create normal applications (league host & rank management)
+        await supportChannel.send({
+          embeds: [buildApplicationPanelEmbed()],
+          components: [buildApplicationPanelButtons()],
+        });
+        return interaction.reply({ content: '✅ Normal applications panel has been posted to the support channel.', ephemeral: true });
+      }
+    } catch (err) {
+      console.error('Failed to post application panel:', err);
+      return interaction.reply({ content: 'Failed to post application panel. Check channel ID.', ephemeral: true });
+    }
+  }
+});
+
+// ─── Global safety nets ─────────────────────────────────────────────────────
+// Prevent unhandled Discord API errors (e.g. expired interactions) or any
+// other uncaught async errors from crashing the bot process.
+process.on('unhandledRejection', (reason) => {
+  if (reason && reason.code && IGNORABLE_INTERACTION_ERROR_CODES.has(reason.code)) {
+    console.warn(`[UnhandledRejection] Ignored expired/invalid interaction error (code ${reason.code}).`);
+    return;
+  }
+  console.error('[UnhandledRejection] Unhandled promise rejection:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[UncaughtException] Uncaught exception:', err);
+});
+
+client.login(TOKEN);
