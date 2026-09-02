@@ -1,11 +1,17 @@
-// Load .env file only in development
+// ─── Environment setup ─────────────────────────────────────────────────────
+// Railway does not set NODE_ENV by default, so default to 'production' unless
+// it has explicitly been set to something else (e.g. 'development' locally).
+if (!process.env.NODE_ENV) {
+  process.env.NODE_ENV = 'production';
+}
+
+// Load .env file only in development. In production (Railway), environment
+// variables are already injected into process.env, so dotenv is unnecessary.
 if (process.env.NODE_ENV !== 'production') {
   require('dotenv').config();
 }
 
-require('dotenv').config();
 const {
-
   Client,
   GatewayIntentBits,
   ChannelType,
@@ -28,6 +34,38 @@ const path = require('path');
 const TOKEN          = process.env.DISCORD_BOT_TOKEN;
 const CLIENT_ID      = process.env.CLIENT_ID;
 const GUILD_ID       = process.env.GUILD_ID;
+
+// ─── Validate required environment variables SYNCHRONOUSLY ────────────────
+// This must run before any async operations (including client.login) so the
+// process exits immediately with a clear error instead of discord.js
+// throwing an "invalid Authorization header" unhandled rejection later.
+function maskToken(token) {
+  if (!token) return '(empty)';
+  return `${token.slice(0, 5)}... (length: ${token.length})`;
+}
+
+console.log(`[Startup] NODE_ENV=${process.env.NODE_ENV}`);
+console.log(`[Startup] DISCORD_BOT_TOKEN=${maskToken(TOKEN)}`);
+console.log(`[Startup] CLIENT_ID=${CLIENT_ID || '(empty)'}`);
+console.log(`[Startup] GUILD_ID=${GUILD_ID || '(empty)'}`);
+
+if (!TOKEN || typeof TOKEN !== 'string' || TOKEN.trim().length === 0) {
+  console.error('[Startup] ✗ FATAL: DISCORD_BOT_TOKEN is missing or empty.');
+  console.error('[Startup] Set the DISCORD_BOT_TOKEN environment variable in Railway before starting the bot.');
+  process.exit(1);
+}
+
+if (!CLIENT_ID || typeof CLIENT_ID !== 'string' || CLIENT_ID.trim().length === 0) {
+  console.error('[Startup] ✗ FATAL: CLIENT_ID is missing or empty.');
+  console.error('[Startup] Set the CLIENT_ID environment variable in Railway before starting the bot.');
+  process.exit(1);
+}
+
+if (!GUILD_ID || typeof GUILD_ID !== 'string' || GUILD_ID.trim().length === 0) {
+  console.error('[Startup] ✗ FATAL: GUILD_ID is missing or empty.');
+  console.error('[Startup] Set the GUILD_ID environment variable in Railway before starting the bot.');
+  process.exit(1);
+}
 const LEAGUE_CHANNEL = '1498804106628956211';
 const SHOP_CHANNEL   = '1510600135862648952';
 const HOST_ROLE      = '1459877884645740846';
@@ -709,6 +747,16 @@ client.once('ready', async () => {
   console.log('═══════════════════════════════════════════════════════\n');
   
   await registerCommands();
+});
+
+// Catch client-level errors (e.g. websocket/gateway errors) so they don't
+// bubble up as uncaught/unhandled crashes.
+client.on('error', (err) => {
+  console.error('[Client] ✗ Discord client error:', err);
+});
+
+client.on('shardError', (err) => {
+  console.error('[Client] ✗ Discord shard error:', err);
 });
 
 // ─── Interaction helpers ─────────────────────────────────────────────────────
@@ -1432,4 +1480,18 @@ process.on('uncaughtException', (err) => {
   console.error('[UncaughtException] Uncaught exception:', err);
 });
 
-client.login(TOKEN);
+// ─── Login ───────────────────────────────────────────────────────────────
+// Wrap login in try/catch + .catch() so a bad/invalid token produces a clean,
+// readable error and a controlled exit instead of an unhandled rejection
+// crash with a cryptic "invalid Authorization header" message.
+(async () => {
+  try {
+    await client.login(TOKEN);
+  } catch (err) {
+    console.error('[Startup] ✗ FATAL: Failed to log in to Discord.');
+    console.error(`[Startup] Token used: ${maskToken(TOKEN)}`);
+    console.error('[Startup] Verify DISCORD_BOT_TOKEN is correct and has not been regenerated/revoked.');
+    console.error(err);
+    process.exit(1);
+  }
+})();
